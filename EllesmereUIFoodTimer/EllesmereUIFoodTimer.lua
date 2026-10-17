@@ -344,9 +344,31 @@ local function MakeBar(parent)
     return b
 end
 
+-- One DEDICATED bar per kind (food / drink / both), never reused for another
+-- kind: a bar that showed Drink (mana curve, secret values) and then Food
+-- stopped rendering on this client (field 2026-10-17: re-eating while
+-- drinking moved Food from slot 2 to slot 1 and the bar went blank).
+local BAR_KINDS = { "food", "drink", "both" }
+
+local KIND_INDEX = { food = 1, drink = 2, both = 3 }
+
+-- A brand-new bar for kind slot i (diagnostic Hide hooks included).
+local function CreateKindBar(f, i)
+    local b = MakeBar(f)
+    f.bars[i] = b
+    b._kind = BAR_KINDS[i]
+    f.byKind[BAR_KINDS[i]] = b
+    hooksecurefunc(b, "Hide", function()
+        b._hideAt = GetTime()
+        b._hideBy = debugstack and debugstack(3, 4, 0) or "?"
+    end)
+    return b
+end
+
 local function MakeWidget(f)
     f.bars = {}
-    for i = 1, MAX_BARS do f.bars[i] = MakeBar(f) end
+    f.byKind = {}
+    for i = 1, MAX_BARS do CreateKindBar(f, i) end
     return f
 end
 
@@ -377,31 +399,56 @@ local function StyleBar(b)
     b.time:SetTextColor(tr, tg, tb)
     b.res:SetTextColor(tr, tg, tb)
     b.full:SetTextColor(tr, tg, tb)
+    -- FIXED slots, no anchor follows a text's width: the percent text can be
+    -- a SECRET value, and a layout that depends on a secret width left the
+    -- Food bar blank after it was hidden and shown again (field 2026-10-17).
+    local timeW = math.floor(size * 2.8 + 0.5)   -- "9.4s" / "12:34"
+    local resW  = math.floor(size * 4.6 + 0.5)   -- "HP 100%" / "Full"
     b.time:ClearAllPoints()
     b.time:SetPoint("RIGHT", b.sb, "RIGHT", -4, 0)
+    b.time:SetWidth(timeW)
     b.res:ClearAllPoints()
-    b.res:SetPoint("RIGHT", b.time, "LEFT", -8, 0)
+    b.res:SetPoint("RIGHT", b.sb, "RIGHT", -(4 + timeW + 4), 0)
+    b.res:SetWidth(resW)
     b.full:ClearAllPoints()
-    b.full:SetPoint("RIGHT", b.time, "LEFT", -8, 0)
+    b.full:SetPoint("RIGHT", b.sb, "RIGHT", -(4 + timeW + 4), 0)
+    b.full:SetWidth(resW)
+    for _, fs in ipairs({ b.time, b.res, b.full }) do
+        fs:SetJustifyH("RIGHT")
+        fs:SetWordWrap(false)
+    end
     b.name:ClearAllPoints()
     b.name:SetPoint("LEFT", b.sb, "LEFT", 4, 0)
-    b.name:SetPoint("RIGHT", b.res, "LEFT", -4, 0)
+    b.name:SetPoint("RIGHT", b.sb, "RIGHT", -(4 + timeW + 4 + resW + 4), 0)
 end
 
 local function StyleWidget(f)
     local h = Get("ftHeight")
     local up = Get("ftGrow") == "up"
-    for i, b in ipairs(f.bars) do
+    for _, b in ipairs(f.bars) do
         StyleBar(b)
-        b:ClearAllPoints()
-        local off = (i - 1) * (h + GAP)
-        if up then
-            b:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 0, off)
-        else
-            b:SetPoint("TOPLEFT", f, "TOPLEFT", 0, -off)
-        end
+        b._slot = nil -- re-anchor on the next paint
     end
+    f._up = up
+    f._h = h
     f:SetSize(Get("ftWidth"), h)
+end
+
+-- Put a bar in a stacking slot (1 = first); only re-anchors when it moves.
+-- Re-anchored on EVERY paint, on purpose: on this client a bar anchored while
+-- its stack frame was hidden / just being shown stayed blank (shown, visible,
+-- alpha 1, right text, nothing drawn) until it was anchored again — field
+-- 2026-10-17: the bar that arrived alone stayed blank, and came back the
+-- moment a second buff pushed it to another slot.
+local function AnchorSlot(f, b, slot)
+    b._slot, b._slotUp, b._slotH = slot, f._up, f._h
+    b:ClearAllPoints()
+    local off = (slot - 1) * ((f._h or Get("ftHeight")) + GAP)
+    if f._up then
+        b:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 0, off)
+    else
+        b:SetPoint("TOPLEFT", f, "TOPLEFT", 0, -off)
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -565,17 +612,50 @@ local function PaintBar(b, d, now)
 end
 
 -- Paint the whole stack; returns the number of bars shown.
+-- On this client a bar that was SHOWN, HIDDEN and then SHOWN again (the Food
+-- bar when you eat again: the old buff drops for a moment) can stop rendering
+-- for good: shown / visible / alpha 1 / right text, yet nothing on screen, and
+-- even an outline anchored to it is not drawn. A bar fresh from CreateFrame
+-- always draws (first meal after /reload is fine). So every time a kind's bar
+-- comes BACK after being hidden, it is replaced by a brand-new frame; the old
+-- one is hidden, detached and dropped.
+local function FreshBar(f, kind)
+    local i = KIND_INDEX[kind]
+    local old = f.byKind[kind]
+    if old then
+        old:Hide()
+        old:ClearAllPoints()
+        old._dead = true
+    end
+    local b = CreateKindBar(f, i)
+    StyleBar(b)
+    b:SetFrameLevel(f:GetFrameLevel() + 1)
+    f._renewed = (f._renewed or 0) + 1
+    return b
+end
+
 local function PaintWidget(f, entries, now)
     local n = 0
-    for i, b in ipairs(f.bars) do
-        local d = entries[i]
-        if d then
+    local used = {}
+    local prev = f._prevKinds or {}
+    local nowKinds = {}
+    for _, d in ipairs(entries) do
+        local b = f.byKind and f.byKind[d.kind]
+        if b and not used[b] then -- a second aura of the same kind: skip
+            -- (v19 replaced a returning bar with a new frame: did not help,
+            -- the re-anchor above is the fix; FreshBar is kept but unused.)
+            nowKinds[d.kind] = true
+            used[b] = true
+            n = n + 1
+            AnchorSlot(f, b, n)
             PaintBar(b, d, now)
-            n = i
-        else
-            b:Hide()
+            b._everShown = true
         end
     end
+    for _, b in ipairs(f.bars) do
+        if not used[b] then b:Hide() end
+    end
+    f._prevKinds = nowKinds
     local h = Get("ftHeight")
     f:SetSize(Get("ftWidth"), math.max(h, n * h + math.max(0, n - 1) * GAP))
     return n
@@ -625,8 +705,10 @@ local function OnUpdate(self, elapsed)
     -- UNIT_AURA (or refreshed) still shows up / updates.
     if rescanAcc >= 1 then
         rescanAcc = 0
-        Scan()
-        UpdateFed()
+        local okS, errS = pcall(Scan)
+        if not okS then ns.lastError = "Scan: " .. tostring(errS) end
+        local okF, errF = pcall(UpdateFed)
+        if not okF then ns.lastError = "UpdateFed: " .. tostring(errF) end
     end
     local now = GetTime()
     -- Expired between aura events: drop it
@@ -637,7 +719,8 @@ local function OnUpdate(self, elapsed)
         self:Hide()
         return
     end
-    PaintWidget(self, list, now)
+    local ok, err = pcall(PaintWidget, self, list, now)
+    if not ok then ns.lastError = "OnUpdate: " .. tostring(err) end
 end
 
 -------------------------------------------------------------------------------
@@ -842,6 +925,9 @@ local function Build()
     MakeWidget(frame)
     frame:Hide()
     frame:SetScript("OnUpdate", OnUpdate)
+    -- The whole stack hidden (no buff left): every bar that comes back after
+    -- this counts as "coming back" and gets a fresh frame (see FreshBar).
+    frame:HookScript("OnHide", function(self) self._prevKinds = nil end)
     Place()
     return frame
 end
@@ -866,17 +952,34 @@ function Update(isRetry)
         return
     end
     Build()
-    Scan()
+    local okScan, err = pcall(Scan)
+    if not okScan then ns.lastError = err end
     if pending then QueueRetry() end
-    UpdateFed()
-    if S.unlocked then return end
-    if #list > 0 then
-        PaintWidget(frame, list, GetTime())
-        frame:Show()
-    else
-        frame:Hide()
+    -- The bars first, and the Well Fed icon in a pcall: an icon error must
+    -- never take the eating / drinking bars down with it.
+    if not S.unlocked then
+        if #list > 0 then
+            -- Show FIRST, then anchor + paint: anchoring the bars while the
+            -- stack frame was still hidden is what left them blank.
+            frame:Show()
+            local okPaint, perr = pcall(PaintWidget, frame, list, GetTime())
+            if not okPaint then ns.lastError = perr end
+        else
+            frame:Hide()
+        end
     end
+    local okFed, ferr = pcall(UpdateFed)
+    if not okFed then ns.lastError = ferr end
 end
+
+-- Safety net: once a second, while the bars are hidden, look again (cheap:
+-- one pass over the player's buffs). Catches a Food / Drink buff whose
+-- UNIT_AURA came before its data was usable.
+C_Timer.NewTicker(1, function()
+    if not events or not Enabled() or S.unlocked then return end -- before login / off
+    if frame and frame:IsShown() then return end
+    Update(true)
+end)
 
 local function OnEvent(_, event)
     if event == "PLAYER_ENTERING_WORLD" then
@@ -1299,6 +1402,65 @@ SLASH_EUIFOODTIMER1 = "/foodtimer"
 SLASH_EUIFOODTIMER2 = "/euifood"
 SlashCmdList.EUIFOODTIMER = function(msg)
     msg = msg and msg:lower() or ""
+    if msg:match("find") then
+        -- Draw a bright frame around the bar area for 6 s, on top of everything.
+        if not frame then Say("the bar frame is not built yet."); return end
+        if not frame._finder then
+            local fz = CreateFrame("Frame", nil, UIParent)
+            fz:SetFrameStrata("TOOLTIP")
+            local t = fz:CreateTexture(nil, "OVERLAY")
+            t:SetAllPoints()
+            t:SetColorTexture(1, 0, 1, 0.45)
+            fz.label = fz:CreateFontString(nil, "OVERLAY", "GameFontHighlightLarge")
+            fz.label:SetPoint("BOTTOM", fz, "TOP", 0, 4)
+            fz.label:SetText("Food Timer bars are here")
+            frame._finder = fz
+        end
+        local fz = frame._finder
+        fz:ClearAllPoints()
+        fz:SetPoint("TOPLEFT", frame, "TOPLEFT", -4, 4)
+        fz:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", 4, -4)
+        fz:Show()
+        -- One outline per bar, anchored to the bar itself: red = bar 1, green = bar 2, blue = bar 3.
+        frame._barFinders = frame._barFinders or {}
+        local cols = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0.4, 1 } }
+        for i, b in ipairs(frame.bars) do
+            local bf = frame._barFinders[i]
+            if not bf then
+                bf = CreateFrame("Frame", nil, UIParent)
+                bf:SetFrameStrata("TOOLTIP")
+                bf.edges = {}
+                for e = 1, 4 do
+                    local t = bf:CreateTexture(nil, "OVERLAY")
+                    t:SetColorTexture(cols[i][1], cols[i][2], cols[i][3], 1)
+                    bf.edges[e] = t
+                end
+                bf.edges[1]:SetPoint("TOPLEFT"); bf.edges[1]:SetPoint("TOPRIGHT"); bf.edges[1]:SetHeight(3)
+                bf.edges[2]:SetPoint("BOTTOMLEFT"); bf.edges[2]:SetPoint("BOTTOMRIGHT"); bf.edges[2]:SetHeight(3)
+                bf.edges[3]:SetPoint("TOPLEFT"); bf.edges[3]:SetPoint("BOTTOMLEFT"); bf.edges[3]:SetWidth(3)
+                bf.edges[4]:SetPoint("TOPRIGHT"); bf.edges[4]:SetPoint("BOTTOMRIGHT"); bf.edges[4]:SetWidth(3)
+                bf.label = bf:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+                bf.label:SetPoint("LEFT", bf, "RIGHT", 6, 0)
+                bf.label:SetText("bar " .. i)
+                frame._barFinders[i] = bf
+            end
+            if b:IsShown() then
+                bf:ClearAllPoints()
+                bf:SetAllPoints(b)
+                bf:Show()
+                C_Timer.After(6, function() bf:Hide() end)
+                Say(string.format("bar %d (%s) is at %.0f, %.0f, top %.0f, points %d",
+                    i, tostring(b.name:GetText()), b:GetLeft() or -1, b:GetBottom() or -1, b:GetTop() or -1, b:GetNumPoints()))
+            else
+                bf:Hide()
+            end
+        end
+        C_Timer.After(6, function() fz:Hide() end)
+        Say(string.format("bar frame is at %.0f, %.0f (screen left / bottom), strata %s, level %d, shown = %s",
+            frame:GetLeft() or -1, frame:GetBottom() or -1, frame:GetFrameStrata(), frame:GetFrameLevel(),
+            tostring(frame:IsShown())))
+        return
+    end
     if msg:match("debug") then
         if not NAMES then BuildNames() end
         local names = {}
@@ -1328,7 +1490,49 @@ SlashCmdList.EUIFOODTIMER = function(msg)
             end
         end
         Scan()
-        Say("pending = " .. tostring(pending))
+        Say("bars renewed so far: " .. tostring(frame and frame._renewed or 0))
+        Say("pending = " .. tostring(pending) .. ", bars = " .. #list
+            .. ", bar frame shown = " .. tostring(frame and frame:IsShown() or false))
+        if ns.lastError then Say("last error: " .. tostring(ns.lastError)) end
+        if frame then
+            local p1, rel, rp, x, y = frame:GetPoint(1)
+            Say(string.format("bar frame: unlocked = %s, alpha = %.2f, size = %dx%d, point = %s %s %s %.0f %.0f, parent = %s",
+                tostring(S.unlocked), frame:GetEffectiveAlpha() or -1, frame:GetWidth() or 0, frame:GetHeight() or 0,
+                tostring(p1), tostring(rel and rel.GetName and rel:GetName() or rel), tostring(rp), x or 0, y or 0,
+                tostring(frame:GetParent() and frame:GetParent():GetName())))
+            for i, b in ipairs(frame.bars) do
+                if b:IsShown() or list[i] then
+                    local r, g, bl, a = b.sb:GetStatusBarColor()
+                    Say(string.format("bar %d: shown = %s, visible = %s, alpha = %.2f, size = %dx%d, value = %s, color = %s, name = %s, time = %s",
+                        i, tostring(b:IsShown()), tostring(b:IsVisible()), b:GetEffectiveAlpha() or -1,
+                        b:GetWidth() or 0, b:GetHeight() or 0, sv(b.sb:GetValue()),
+                        Plain(r) and string.format("%.2f %.2f %.2f %.2f", r or 0, g or 0, bl or 0, a or 0) or "<secret>",
+                        sv(b.name:GetText()), sv(b.time:GetText())))
+                    local tex = b.sb:GetStatusBarTexture()
+                    local font, fsize = b.name:GetFont()
+                    local function ag(f)
+                        local n, playing = 0, 0
+                        for _, g in ipairs({ f:GetAnimationGroups() }) do
+                            n = n + 1
+                            if g:IsPlaying() then playing = playing + 1 end
+                        end
+                        return n .. "/" .. playing
+                    end
+                    local _, _, _, bga = b.bg:GetVertexColor()
+                    if b._hideBy then
+                        Say(string.format("bar %d last hidden %.1fs ago by: %s", i, GetTime() - (b._hideAt or 0),
+                            tostring(b._hideBy):gsub("\n", " || ")))
+                    end
+                    Say(string.format("bar %d detail: scale b/sb/frame = %.3f/%.3f/%.3f, sb visible = %s, fill tex = %s (shown %s, alpha %.2f), bg alpha = %s, font = %s %s, text alpha = %.2f, anims frame/b/sb = %s %s %s, strata b = %s lvl %d",
+                        i, b:GetEffectiveScale() or -1, b.sb:GetEffectiveScale() or -1, frame:GetEffectiveScale() or -1,
+                        tostring(b.sb:IsVisible()), tostring(tex and tex:GetTexture()), tostring(tex and tex:IsShown()),
+                        tex and tex:GetAlpha() or -1, sv(bga), tostring(font), tostring(fsize),
+                        b.name:GetAlpha() or -1, ag(frame), ag(b), ag(b.sb), b:GetFrameStrata(), b:GetFrameLevel()))
+                end
+            end
+        else
+            Say("bar frame: not built")
+        end
         if #list == 0 then Say("no food / drink buff on you right now.") end
         for _, d in ipairs(list) do
             Say(string.format("%s (%s): %.1fs left of %.0fs", d.name, d.kind,
